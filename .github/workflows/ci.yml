@@ -1,0 +1,109 @@
+name: CI
+
+on:
+  push:
+    branches: [main, staging]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+# Giá trị dưới đây chỉ dùng cho container Postgres tạm thời của CI — không phải secret production.
+env:
+  NODE_VERSION: '22'
+  DATABASE_URL: postgres://swin:swin@127.0.0.1:5432/swin
+  TEST_DATABASE_URL: postgres://swin:swin@127.0.0.1:5432/swin_test
+  PAYLOAD_SECRET: ci-only-secret-not-used-in-production
+  NEXT_PUBLIC_SITE_URL: http://localhost:3000
+  MEDIA_DIR: ./media
+  CRM_API_URL: http://127.0.0.1:4010/api/leads
+  CRM_API_TOKEN: local-dev-token
+  JOBS_AUTORUN: 'true'
+  # Test key công khai của Cloudflare (luôn pass) — bản build production bắt buộc có Turnstile
+  TURNSTILE_SITE_KEY: 1x00000000000000000000AA
+  TURNSTILE_SECRET_KEY: 1x0000000000000000000000000000000AA
+
+jobs:
+  quality:
+    name: Lint · Typecheck · Unit
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: swin
+          POSTGRES_PASSWORD: swin
+          POSTGRES_DB: swin_test
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U swin" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm lint
+      - run: pnpm typecheck
+      - run: pnpm test
+
+  e2e:
+    name: Build · E2E · Lighthouse
+    runs-on: ubuntu-24.04
+    needs: quality
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: swin
+          POSTGRES_PASSWORD: swin
+          POSTGRES_DB: swin
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U swin" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm payload migrate
+      - run: pnpm seed --reset
+      - run: pnpm build
+      - name: Chuẩn bị bản standalone
+        run: |
+          cp -r .next/static .next/standalone/.next/static
+          [ -d public ] && cp -r public .next/standalone/public || true
+          ln -s "$PWD/media" .next/standalone/media
+      - name: Chạy mock CRM + app
+        run: |
+          nohup pnpm mock-crm > mock-crm.log 2>&1 &
+          (cd .next/standalone && MEDIA_DIR="$PWD/media" nohup node server.js > ../../app.log 2>&1 &)
+          npx --yes wait-on@8 http://localhost:3000 http://localhost:4010/health --timeout 120000
+        env:
+          PORT: '3000'
+          # localhost (không dùng IP) — xem ghi chú trong deploy/ecosystem.config.cjs
+          HOSTNAME: localhost
+          NODE_ENV: production
+      - run: pnpm exec playwright install --with-deps chromium
+      - run: pnpm test:e2e
+        env:
+          E2E_BASE_URL: http://localhost:3000
+          E2E_NO_SERVER: '1'
+      - name: Lighthouse CI (mobile, ≥ 90 mọi hạng mục)
+        run: npx --yes @lhci/cli@0.15.1 autorun
+      - if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: |
+            playwright-report/
+            test-results/
+            app.log
+            mock-crm.log
+          retention-days: 7

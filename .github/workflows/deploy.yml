@@ -1,0 +1,88 @@
+name: Deploy
+
+# Build standalone trên runner → rsync qua SSH → pm2 reload. KHÔNG build trên máy chủ (CLAUDE.md mục 3).
+# Migration DB chạy khi instance 0 khởi động (prodMigrations). Xem deploy/README.md.
+
+on:
+  push:
+    branches: [main, staging]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Môi trường'
+        type: choice
+        options: [staging, production]
+        default: staging
+
+concurrency:
+  group: deploy-${{ github.event.inputs.environment || (github.ref_name == 'main' && 'production' || 'staging') }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-24.04
+    environment: ${{ github.event.inputs.environment || (github.ref_name == 'main' && 'production' || 'staging') }}
+    env:
+      RELEASE: ${{ github.sha }}
+      APP_ROOT: ${{ vars.APP_ROOT }}
+      PM2_APP: ${{ vars.PM2_APP }}
+      APP_PORT: ${{ vars.APP_PORT }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+
+      - name: Build standalone
+        run: pnpm build
+        env:
+          NEXT_PUBLIC_SITE_URL: ${{ vars.SITE_URL }}
+          # Build không kết nối DB (không prerender trang có dữ liệu); placeholder chỉ để nạp config
+          DATABASE_URL: postgres://build:build@127.0.0.1:5432/build
+          PAYLOAD_SECRET: build-time-placeholder
+
+      - name: Đóng gói release
+        run: |
+          mkdir -p release
+          cp -r .next/standalone/. release/
+          cp -r .next/static release/.next/static
+          [ -d public ] && cp -r public release/public || true
+          mkdir -p release/deploy && cp deploy/*.cjs deploy/*.sh deploy/nginx.conf release/deploy/
+          echo "$RELEASE" > release/REVISION
+
+      - name: SSH key
+        run: |
+          install -m 700 -d ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_deploy && chmod 600 ~/.ssh/id_deploy
+          echo "${{ secrets.SSH_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+
+      - name: Rsync
+        run: |
+          rsync -az --delete -e "ssh -i ~/.ssh/id_deploy" release/ \
+            "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:${APP_ROOT}/app/releases/${RELEASE}/"
+
+      - name: Kích hoạt + pm2 reload
+        run: |
+          ssh -i ~/.ssh/id_deploy "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" bash -s <<EOF
+          set -euo pipefail
+          cd "${APP_ROOT}/app"
+          ln -sfn "${APP_ROOT}/media" "releases/${RELEASE}/media"
+          ln -sfn "releases/${RELEASE}" current
+          pm2 startOrReload current/deploy/ecosystem.config.cjs --only "${PM2_APP}" --update-env
+          pm2 save
+          # Giữ 5 bản gần nhất để quay lui
+          ls -1dt releases/* | tail -n +6 | xargs -r rm -rf
+          EOF
+
+      - name: Kiểm tra sau deploy
+        run: |
+          for i in $(seq 1 20); do
+            code=$(ssh -i ~/.ssh/id_deploy "${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}" \
+              "curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:${APP_PORT}/robots.txt" || true)
+            [ "$code" = "200" ] && echo "OK" && exit 0
+            sleep 5
+          done
+          echo "App không phản hồi 200" && exit 1
